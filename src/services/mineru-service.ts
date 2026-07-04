@@ -42,7 +42,7 @@ export class MineruService {
     }
     formData.append(
       "files",
-      new Blob([fileBuffer], { type: "application/octet-stream" }),
+      new Blob([new Uint8Array(fileBuffer)], { type: "application/octet-stream" }),
       filename
     );
 
