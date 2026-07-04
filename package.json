@@ -26,6 +26,7 @@
     "fastify": "^5.2.1",
     "gpt-tokenizer": "^3.4.0",
     "jsonwebtoken": "^9.0.2",
+    "jszip": "^3.10.1",
     "pg": "^8.13.1",
     "pino": "^9.6.0",
     "zod": "^3.24.1"
