@@ -2,7 +2,7 @@ import { aiSettingsService, type AiRuntimeSettings } from "../services/ai-settin
 import type { ExtractedEntity, ExtractedEvent, EventRecord } from "../types.js";
 import { createModelCallLogger } from "../observability/model-call-log.js";
 
-type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
 export interface LlmClient {
   extractNamedEntities(query: string): Promise<string[]>;
@@ -17,6 +17,8 @@ export interface LlmClient {
     candidates: EventRecord[];
     topK: number;
   }): Promise<string[]>;
+  chat(messages: ChatMessage[]): Promise<string>;
+  chatStream(messages: ChatMessage[], onChunk: (chunk: string) => void): Promise<string>;
 }
 
 export class OpenAICompatibleLlmClient implements LlmClient {
@@ -106,6 +108,165 @@ export class OpenAICompatibleLlmClient implements LlmClient {
     return Array.isArray(ids)
       ? ids.map(String).filter((id) => input.candidates.some((candidate) => candidate.id === id)).slice(0, input.topK)
       : localRerank(input.query, input.candidates, input.topK);
+  }
+
+  async chat(messages: ChatMessage[]): Promise<string> {
+    const settings = await aiSettingsService.getRuntimeSettings();
+    if (!settings.hasRemoteLlm) {
+      throw new Error("No LLM configured");
+    }
+
+    const url = `${settings.llmBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const body = {
+      model: settings.llmModel,
+      messages,
+      temperature: 0.7,
+    };
+
+    let lastError: unknown;
+    const maxAttempts = settings.llmMaxRetries + 1;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), settings.llmTimeoutMs);
+      const log = createModelCallLogger({
+        kind: "llm",
+        operation: "chat",
+        request: { url, method: "POST", attempt, maxAttempts, body },
+      });
+      let logged = false;
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            Authorization: `Bearer ${settings.llmApiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+        const { responseText, responseBody } = await readResponseBody(response);
+        if (!response.ok) {
+          const error = new Error(`llm chat failed: ${response.status} ${responseText.slice(0, 500)}`);
+          log.fail(error, { status: response.status, body: responseBody });
+          logged = true;
+          lastError = error;
+          if (attempt < maxAttempts && isRetryableHttpStatus(response.status)) {
+            await waitBeforeRetry(attempt);
+            continue;
+          }
+          throw error;
+        }
+        const json = responseBody as { choices?: Array<{ message?: { content?: string } }> };
+        const content = json.choices?.[0]?.message?.content ?? "";
+        log.succeed({ status: response.status, contentLength: content.length });
+        return content;
+      } catch (error) {
+        lastError = error;
+        if (!logged) {
+          log.fail(error);
+        }
+        if (attempt < maxAttempts && isRetryableFetchError(error)) {
+          await waitBeforeRetry(attempt);
+          continue;
+        }
+        throw error;
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
+  async chatStream(messages: ChatMessage[], onChunk: (chunk: string) => void): Promise<string> {
+    const settings = await aiSettingsService.getRuntimeSettings();
+    if (!settings.hasRemoteLlm) {
+      throw new Error("No LLM configured");
+    }
+
+    const url = `${settings.llmBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const body = {
+      model: settings.llmModel,
+      messages,
+      temperature: 0.7,
+      stream: true,
+      stream_options: { include_usage: false },
+    };
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), settings.llmTimeoutMs);
+    const log = createModelCallLogger({
+      kind: "llm",
+      operation: "chatStream",
+      request: { url, method: "POST", body },
+    });
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${settings.llmApiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      if (!response.ok) {
+        const error = new Error(`llm stream request failed: ${response.status}`);
+        log.fail(error, { status: response.status });
+        throw error;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error("No response body for streaming");
+      }
+
+      const decoder = new TextDecoder();
+      let fullContent = "";
+      let buffer = "";
+
+      const processLine = (line: string): void => {
+        if (line.startsWith("data: ")) {
+          const data = line.slice(6).trim();
+          if (data === "[DONE]") return;
+          try {
+            const parsed = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string } }> };
+            const delta = parsed.choices?.[0]?.delta?.content ?? "";
+            if (delta) {
+              fullContent += delta;
+              onChunk(delta);
+            }
+          } catch {
+            // Skip malformed JSON lines in SSE stream
+          }
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex: number;
+        while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+          const line = buffer.slice(0, newlineIndex);
+          buffer = buffer.slice(newlineIndex + 1);
+          processLine(line);
+        }
+      }
+
+      if (buffer.trim()) {
+        processLine(buffer.trim());
+      }
+
+      log.succeed({ contentLength: fullContent.length });
+      return fullContent;
+    } catch (error) {
+      log.fail(error);
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   private async chatJson(settings: AiRuntimeSettings, input: {
