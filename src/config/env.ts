@@ -10,6 +10,7 @@ const envSchema = z.object({
   HTTP_PORT: z.coerce.number().int().positive().default(4173),
   DATABASE_URL: z.string().min(1).default("postgres://knowledge:knowledge_pass@localhost:5432/knowledge_engine"),
   REDIS_URL: z.string().min(1).default("redis://localhost:6379"),
+  DEFAULT_TENANT_ID: z.string().min(1).default("default"),
   AUTH_SECRET: z.string().min(16).default("change-me-to-a-random-secret-min-16-chars"),
   AUTH_TOKEN_EXPIRY_HOURS: z.coerce.number().int().positive().default(72),
   STORAGE_PATH: z.string().default("./storage"),

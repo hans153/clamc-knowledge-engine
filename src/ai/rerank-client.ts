@@ -1,4 +1,4 @@
-import { config } from "../../config/env.js";
+import { config } from "../config/env.js";
 import { aiSettingsService, type AiRuntimeSettings } from "../services/ai-settings-service.js";
 import { createModelCallLogger } from "../observability/model-call-log.js";
 import type { EventRecord } from "../types.js";
