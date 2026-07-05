@@ -5,18 +5,78 @@ services:
       POSTGRES_USER: knowledge
       POSTGRES_PASSWORD: knowledge_pass
       POSTGRES_DB: knowledge_engine
-    ports:
-      - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "knowledge"]
+      interval: 5s
+      retries: 5
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
     volumes:
       - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://knowledge:knowledge_pass@postgres:5432/knowledge_engine
+      REDIS_URL: redis://redis:6379
+      STORAGE_PATH: /data/storage
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: 4173
+      AUTH_SECRET: ${AUTH_SECRET:-change-me-in-production}
+      MINERU_API_URL: ${MINERU_API_URL:-http://mineru-router:8002}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.302ai.cn/v1}
+      LLM_MODEL: ${LLM_MODEL:-qwen3.6-flash}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-https://api.302ai.cn/v1}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-large}
+      RERANK_BASE_URL: ${RERANK_BASE_URL:-}
+      RERANK_MODEL: ${RERANK_MODEL:-qwen3-rerank}
+    volumes:
+      - storage:/data/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    depends_on:
+      - api
+
+  mineru-router:
+    image: lpdswing/mineru-web-mineru-api:v3.4.0
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - mineru-cache:/root/.cache
+    profiles:
+      - gpu
 
 volumes:
   pgdata:
   redisdata:
+  storage:
+  mineru-cache:
